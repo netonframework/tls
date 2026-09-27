@@ -19,9 +19,18 @@
   → `engine.read` 直接解密进调用方 `dst` 的底层数组（`reserve` / `commitWrite`，不经中间缓冲）。
 - 出站：`engine.write` 直接从调用方 `src` 的底层数组取明文（每次至多 16 KiB，一条记录）→ `engine.drainCiphertext` 取出密文 →
   `inner.write`。**`src` 只在该段明文对应的密文全部交给 `inner` 之后才前移**。
-- 读方向产生的密文（TLS 1.3 会话票据的确认、KeyUpdate 应答、告警）由读者负责写出；读者与写者共用一把写锁，保证 `inner`
-  上同一时刻只有一个写（§28.6 规则）。
-- 缓冲：每连接一个密文输入缓冲、一个密文输出缓冲（各 `engine` 缓冲容量 + 一条记录的余量），连接存续期间复用。
+- **按 OpenSSL 的重试契约调度**（SSL_get_error(3)，4.0.2 原文："If you get SSL_ERROR_WANT_WRITE from SSL_write() ... you should not do any
+  other operation that could trigger IO other than to repeat the previous SSL_write() call"；WANT_READ 时则可以在两次重试之间读取）：
+  - WANT_WRITE（读、写、握手、close_notify 都可能）：立即、不挂起地把引擎输出取入暂存缓冲，然后重复同一调用；两者之间不做任何其他引擎操作，
+    也**不跨越网络等待**。因此不存在"写重试悬而未决、同时阻塞在网络写上"的状态，对端不读时也不会挡住本端的读。
+  - 写返回 WANT_READ：写者自己取得更多输入（与读者用输入锁和"已喂入代次"协调，同一时刻只有一方读 `inner`，别人刚喂过就不再读），然后重复
+    同一写入；期间读者等待（openssl-kotlin 当前在任何重试期间都拒绝读取；按 OpenSSL 契约 WANT_READ 时本可读取，已请其按原因区分）。
+  - 密文经暂存缓冲写出：持有写锁者把暂存缓冲写给 `inner`；该次写入进行中新取出的密文放入溢出缓冲（正在发送的缓冲不被触碰，io_uring 时由内核
+    持有），写完后接到暂存缓冲之后，顺序不变。暂存缓冲始终是同一数组（交替两个数组会让反应器的固定缓存失效、每次写一次分配，已实测）。
+  - 读者产生的密文（告警、TLS 1.3 握手后消息的应答）：写锁空闲时读者自己写出；否则由持锁者在当前写完后一并写出；暂存超过 64 KiB 时读者等锁，
+    防止对端不断诱发应答使暂存无界增长。
+- 缓冲：每连接一个密文输入缓冲、一个暂存缓冲（各为引擎缓冲容量 + 一条记录的余量）与一个很少使用的溢出缓冲；连接存续期间复用。引擎缓冲容量
+  不再有下限要求（1 KiB 已测）。
 
 ## 3. `IoStream` 契约（neton-io SPEC §28.6）
 
@@ -59,19 +68,21 @@
 ## 6. 实现与验证记录（2026-09-28）
 
 - 依赖：`com.netonstream:openssl:4.0.2`（本机 mavenLocal，openssl-kotlin 提交 aec636c）、`com.netonstream:io` 0.2.0-SNAPSHOT（兄弟目录复合构建）。
-- 测试 11/11：macOS arm64；colima Linux arm64 io_uring（multishot）/ io_uring 单次 RECV / epoll 各 2 次（这也是 openssl-kotlin 的 TLS 路径首次在 Linux 上实际运行）。
+- 测试（初版）11/11：macOS arm64；colima Linux arm64 io_uring（multishot）/ io_uring 单次 RECV / epoll 各 2 次（这也是 openssl-kotlin 的 TLS 路径首次在 Linux 上实际运行）。
   含 `io-testkit` 一致性套件（TCP 之上、内存流之上）全部通过。
-- **引擎的全双工限制**：openssl-kotlin 的 `TlsEngine` 在一次写入等待重试（NEED_WRITE）期间拒绝读取。若双方的写都在等待重试（各自阻塞在
-  TCP 上等对方读），双方的读都不能进行——死锁（引擎缓冲 16 KiB、双向同时 1 MiB 时复现）。对策：每次写入前先写出待发密文，引擎缓冲至少容纳
-  一条完整记录（`MIN_BUFFER` = 17 KiB，默认 32 KiB），应用写入因此不会进入重试；构造时拒绝更小的缓冲。已请 openssl-kotlin 允许重试期间读取
-  （OpenSSL 本身允许在两次 `SSL_write` 重试之间 `SSL_read`）。
+- **初版的全双工死锁与修正**：初版在 WANT_WRITE 后先把密文写到网络（可能阻塞）再重试，重试期间引擎拒绝读取；双方的写都阻塞在 TCP 上时双方都
+  读不了——死锁（引擎缓冲 16 KiB、双向同时 1 MiB 时复现）。初版以"引擎缓冲至少一条记录（17 KiB）"规避，并错误地请 openssl-kotlin 放开重试期间的
+  读取；审查指出 OpenSSL 契约对 WANT_WRITE 恰恰禁止这样做。现行版本按上面 §2 的规则调度：WANT_WRITE 就地取出并立即重试，重试从不跨越网络等待。
+  测试：引擎缓冲 1 KiB / 4 KiB 下双向同时 1 MiB、慢速链路（每次至多 700 字节、写间停顿）下双向同时 96 KiB，均完成；把初版行为放回去，1 KiB 测试
+  挂起（强制超时）。现行 12/12：macOS；colima Linux arm64 三种驱动配置各 2–3 次。
 - **性能**（153，callgrind，TLS 1.3 AES-128-GCM，128 字节回显，12 连接，每请求 =（15 s − 5 s）差值）：
 
   | 版本 | 每请求指令（epoll / io_uring） | 每请求分配 |
   |---|---|---|
   | 初版（每个辅助函数一个挂起函数） | 26.2k / 28.0k | 12 |
   | 全部内联 | 28.8k / 30.3k | 4 → 2（加 `intResult`） |
-  | 热路径内联、少见路径不内联（现行） | 23.5k / 25.0k | 2 |
+  | 热路径内联、少见路径不内联 | 23.5k / 25.0k | 2 |
+  | 按 OpenSSL 重试契约重写调度（现行） | 23.4k / 24.9k | 2 |
   | 对照：neton-io 原始回显（无 TLS） | 2.4k / 3.8k | 0 |
 
   发现：Kotlin/Native 在挂起函数每次进入与恢复时把整个栈帧中的 GC 槽清零；把少见路径也内联使 `read` 的帧涨到 2.7 KB（`memset` 每请求约 5.4k
@@ -79,3 +90,10 @@
   现行版本每请求约 24.6k 指令中的主要项：`memset` 3.2k（其中 OpenSSL `tls_write_records_default` 每条记录约 2.4k，本库帧清零约 0.7k）、
   `ERR_clear_error` 1.1k（封装在每次引擎读写前调用）、OpenSSL 每条记录的 `malloc` / `free` 约 1.3k、数组固定与范围检查（`Pinned`、`checkRange`、
   `pendingCiphertext` 的句柄访问）约 0.9k、真正的加解密（AES-GCM、GHASH）约 2–3k。与 Rust（tokio-rustls / tokio-openssl）的同机对照尚未进行。
+
+  现行版本，三类开销分开统计（epoll，每请求）：Kotlin 堆分配 2 次（66 指令；本库公开 `read` / `write` 的续体）；原生 `malloc` 4 次（172 指令，
+  来自 OpenSSL `CRYPTO_zalloc`）、`free` 103 次（752 指令，`CRYPTO_free`）；`memset` 13 次共 3.1k 指令，其中 OpenSSL `tls_write_records_default`
+  每条记录一次约 2.4k，其余为结构体清零与本库 / 反应器的栈帧清零（各数百指令）。原生分配与清零的用途（结构体初始化、记录缓冲、秘密数据清除）
+  尚未逐项定位，不能为跑分删除秘密数据的清零。
+- 未覆盖：TLS 1.3 KeyUpdate（openssl-kotlin 未提供触发接口，无法在测试中产生）；写入遇到 WANT_READ 的路径（TLS 1.3 下正常情况不会出现，代码按
+  契约处理但尚无测试能触发）。

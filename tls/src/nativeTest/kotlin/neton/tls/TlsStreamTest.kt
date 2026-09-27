@@ -132,15 +132,46 @@ class TlsStreamTest {
 
     @Test fun largeTransfersBothWaysAtOnce() = bothWays(DEFAULT_BUFFER)
 
-    /** The smallest allowed engine buffer (one whole record) still carries full-duplex traffic. */
-    @Test fun largeTransfersBothWaysWithTheSmallestBuffer() = bothWays(MIN_BUFFER)
+    /**
+     * Engine buffers far below one record: every record write returns WANT_WRITE many times. The writer
+     * drains and repeats at once (OpenSSL's rule), so both directions at full speed still complete.
+     */
+    @Test fun largeTransfersBothWaysWith1KiBEngineBuffers() = bothWays(1024)
+    @Test fun largeTransfersBothWaysWith4KiBEngineBuffers() = bothWays(4096)
 
-    /** Below one record, writes would need retries while the engine refuses reads: rejected (SPEC §2). */
-    @Test fun bufferBelowOneRecordIsRejected() = runReactor {
+    /** An inner stream that moves at most [chunk] bytes per call and pauses between writes. */
+    private class SlowLink(private val inner: IoStream, private val chunk: Int) : IoStream by inner {
+        private val pending = Buffer()
+        override suspend fun read(dst: Buffer): Int {
+            if (pending.readableBytes == 0 && inner.read(pending) < 0) return -1
+            val n = minOf(chunk, pending.readableBytes)
+            dst.writeBytes(pending.backingArray(), pending.readerIndex(), n); pending.consume(n)
+            return n
+        }
+        override suspend fun write(src: Buffer): Int {
+            val total = src.readableBytes
+            while (src.readableBytes > 0) {
+                val n = minOf(chunk, src.readableBytes)
+                val part = Buffer(); part.writeBytes(src.backingArray(), src.readerIndex(), n)
+                inner.write(part); src.consume(n)
+                delay(1)
+            }
+            return total
+        }
+    }
+
+    @Test
+    fun slowLinkBothWaysWithSmallEngineBuffers() = runReactor {
         val c = contexts()
-        val (a, _) = tcpRaw()
-        assertFailsWith<IllegalArgumentException> { TlsStream(a, c.client.newEngine(PeerIdentity.Dns("localhost"), 16 * 1024), 16 * 1024) }
-        a.close(); c.close()
+        val (ra, rb) = tcpRaw()
+        val (a, b) = tls(SlowLink(ra, 700) to SlowLink(rb, 700), c, buffer = 1024)
+        val n = 96 * 1024
+        val x = ByteArray(n) { it.toByte() }; val y = ByteArray(n) { (it * 5).toByte() }
+        val w1 = launch { a.write(buf(x)) }; val w2 = launch { b.write(buf(y)) }
+        val r1 = async { readExactly(b, n) }; val r2 = async { readExactly(a, n) }
+        assertContentEquals(x, r1.await()); assertContentEquals(y, r2.await())
+        w1.join(); w2.join()
+        a.close(); b.close(); c.close()
     }
 
     private fun bothWays(buffer: Int) = runReactor {

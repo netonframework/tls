@@ -50,49 +50,57 @@ private suspend inline fun start(stream: IoStream, bufferCapacity: Int, engine: 
     return tls
 }
 
-/**
- * Engine ciphertext buffer size. Twice a record: with pending ciphertext flushed before each write, a
- * full 16 KiB record always fits, so a write rarely has to be retried (while one is pending the engine
- * refuses reads, which would stall a full-duplex connection; SPEC §2).
- */
-const val DEFAULT_BUFFER = 32 * 1024
-
-/** Smallest engine buffer that holds one full record (16 KiB plaintext plus header, tag and padding). */
-const val MIN_BUFFER = 17 * 1024
+/** Engine ciphertext buffer size (the BIO pair's capacity per direction). */
+const val DEFAULT_BUFFER = 16 * 1024
 
 /**
  * TLS over [inner] as an [IoStream] (SPEC §2–§3). The [engine] (openssl-kotlin) does all TLS work;
  * this class moves ciphertext between it and [inner] and maps the result onto the IoStream contract.
  * Takes ownership of [inner] and [engine]: [close] closes both.
+ *
+ * Scheduling follows OpenSSL's retry contract (SSL_get_error(3), SPEC §2):
+ * - WANT_WRITE: the engine's output is drained into [stage] at once, without suspending, and the same
+ *   call is repeated; nothing else touches the engine in between, and no retry stays pending across a
+ *   network wait, so a blocked network write never stops the reader.
+ * - WANT_READ from a write: the writer obtains more input itself (coordinated with the reader through
+ *   [feedLock]) and repeats the write; the reader waits meanwhile (the engine refuses reads then).
+ * - Ciphertext goes out through [stage]: whoever holds [writeLock] writes it to [inner]. While that write is
+ *   in flight, newly drained ciphertext goes to [overflow] (the buffer being sent is never touched; with
+ *   io_uring the kernel owns it) and is appended afterwards, so order is kept. [stage] is always the same
+ *   array, so the reactor's pin cache hits (alternating arrays cost a pin allocation per write).
  */
 class TlsStream(private val inner: IoStream, private val engine: TlsEngine, bufferCapacity: Int = DEFAULT_BUFFER) : IoStream {
-    init {
-        // The engine refuses reads while a write waits for its retry. If both peers' writers were waiting
-        // (each blocked on TCP until the other reads), neither reader could run: a deadlock, reproduced
-        // with a 16 KiB buffer. Flushing before each write plus room for a whole record means application
-        // writes never need a retry (SPEC §2).
-        require(bufferCapacity >= MIN_BUFFER) { "engine buffer must hold a whole TLS record (>= $MIN_BUFFER bytes)" }
-    }
 
     override val capabilities: Set<StreamCapability> =
         inner.capabilities.filterTo(mutableSetOf(StreamCapability.HalfClose)) {
             it == StreamCapability.ReadTimeout || it == StreamCapability.WriteTimeout || it == StreamCapability.IdleTimeout
         }
 
-    // Ciphertext from the peer not yet taken by the engine (its input BIO is bounded), and to the peer.
+    /** Ciphertext from the peer not yet taken by the engine (its input BIO is bounded). */
     private val cin = Buffer(bufferCapacity + RECORD_SLACK)
-    private val cout = Buffer(bufferCapacity + RECORD_SLACK)
+    /** Ciphertext drained from the engine, not yet handed to [inner] (or being handed, see [flushing]). */
+    private val stage = Buffer(bufferCapacity + RECORD_SLACK)
+    /** Ciphertext drained while [stage] is being written. Rare (the reader's replies). */
+    private val overflow = Buffer(0)
+    /** [stage] is in an [inner] write: do not touch it. */
+    private var flushing = false
 
-    /** One writer on [inner] at a time: the writer, and the reader when it must send (alerts, TLS 1.3 post-handshake replies). */
+    /** One writer on [inner]: whoever flushes [stage]. */
     private val writeLock = Mutex()
+    /** One reader on [inner]: the reader, or a writer or the handshake that needs input. */
+    private val feedLock = Mutex()
+    /** Held by a writer while its write waits (WANT_READ) for input; the reader waits on it. */
+    private val retryLock = Mutex()
     private val handshakeLock = Mutex()
+    /** Incremented whenever ciphertext is fed: a waiter that sees it change need not read [inner] itself. */
+    private var fedGeneration = 0L
     private var handshakeDone = false
     private var peerClosed = false
     private var inputEof = false
     private var closed = false
     private var reading = false
     private var writing = false
-    /** The engine holds a write to be retried with the same bytes; it refuses reads until then. */
+    /** A write waits for input (WANT_READ); the engine refuses reads until it is repeated successfully. */
     private var writeRetryPending = false
 
     /** Negotiated ALPN protocol, or null. Valid after the handshake. */
@@ -127,19 +135,27 @@ class TlsStream(private val inner: IoStream, private val engine: TlsEngine, buff
         writing = true
         val n = try {
             guarded(duringHandshake = false) { if (!handshakeDone) ensureHandshake(); writeAll(src) }
-        } finally { writing = false }
+        } finally {
+            writing = false
+            // A write abandoned while waiting for input (failure, cancel: the stream is closed then) must
+            // still release the reader waiting on retryLock.
+            if (writeRetryPending) endWriteRetry()
+        }
         return intResult(n)
     }
 
     override suspend fun flush() {}
 
     override suspend fun shutdownOutput() = guarded(duringHandshake = false) {
-        ensureHandshake()
-        writeLock.withLock {
-            checkOpen()
-            if (!engine.closeNotifySent) engine.closeNotify()
-            flushCiphertext()
+        if (!handshakeDone) ensureHandshake()
+        checkOpen()
+        while (true) {
+            // Not yet received the peer's close_notify is NEED_READ here: fine, ours is out.
+            val p = engine.closeNotify()
+            drainToStage()
+            if (p != TlsProgress.NEED_WRITE) break
         }
+        flushLocked()
     }
 
     override fun setTimeouts(readTimeoutMillis: Long, writeTimeoutMillis: Long, idleTimeoutMillis: Long) {
@@ -187,7 +203,8 @@ class TlsStream(private val inner: IoStream, private val engine: TlsEngine, buff
 
     private suspend fun sendAlertAndClose() {
         if (!closed) try {
-            if (!writeLock.isLocked) writeLock.withLock { flushCiphertext() }
+            drainToStage()                      // allowed after a failure: the alert the engine produced
+            if (!writeLock.isLocked) flushLocked()
         } catch (_: Throwable) {
         }
         close()
@@ -199,11 +216,11 @@ class TlsStream(private val inner: IoStream, private val engine: TlsEngine, buff
             while (!handshakeDone) {
                 checkOpen()
                 val progress = engine.handshake()
-                if (engine.pendingCiphertext > 0) writeLock.withLock { flushCiphertext() }
+                drainToStage()
                 when (progress) {
-                    TlsProgress.COMPLETE -> handshakeDone = true
-                    TlsProgress.NEED_READ -> if (!feedMore()) engine.transportEof()
-                    TlsProgress.NEED_WRITE -> {}
+                    TlsProgress.COMPLETE -> { handshakeDone = true; flushLocked() }
+                    TlsProgress.NEED_WRITE -> {}                       // drained: repeat at once
+                    TlsProgress.NEED_READ -> { flushLocked(); feedOnce() }
                     TlsProgress.PEER_CLOSED -> throw ClosedException("TLS peer closed during the handshake")
                 }
             }
@@ -218,33 +235,52 @@ class TlsStream(private val inner: IoStream, private val engine: TlsEngine, buff
         if (peerClosed) return -1
         while (true) {
             checkOpen()
-            // While a write waits for its retry the engine refuses reads: wait for the writer to finish it.
-            if (writeRetryPending) { writeLock.withLock { }; continue }
+            // A write waiting for input holds the engine (it refuses reads); the writer feeds itself.
+            if (writeRetryPending) { waitForWriteRetry(); continue }
             dst.reserve(MIN_READ)
             val space = dst.backingArray().size - dst.writerIndex()
             val n = engine.read(dst.backingArray(), dst.writerIndex(), space)
             if (n > 0) {
                 dst.commitWrite(n)
-                if (engine.pendingCiphertext > 0) flushLocked()
+                if (engine.pendingCiphertext > 0) readerProduced()
                 return n
             }
             when (n) {
                 TlsEngine.PEER_CLOSED -> {
                     peerClosed = true
-                    if (engine.pendingCiphertext > 0) flushLocked()
+                    if (engine.pendingCiphertext > 0) readerProduced()
                     return -1
                 }
-                TlsEngine.NEED_WRITE -> flushLocked()
+                TlsEngine.NEED_WRITE -> drainToStage()                 // repeat the read at once
                 TlsEngine.NEED_READ -> {
-                    if (engine.pendingCiphertext > 0) flushLocked()
-                    if (!feedMore()) engine.transportEof()   // the next engine.read reports truncation or close
+                    if (engine.pendingCiphertext > 0) readerProduced()
+                    // Read inner only if nobody fed the engine since we looked (a writer may have).
+                    val seen = fedGeneration
+                    feedLock.lock()
+                    try { if (fedGeneration == seen && !feedMore()) engine.transportEof() } finally { feedLock.unlock() }
                 }
                 else -> unexpected("read", n)
             }
         }
     }
 
-    /** Give the engine more ciphertext; false at transport EOF. */
+    /** Take ciphertext the engine produced while reading (alerts, post-handshake replies) and send it. */
+    private suspend fun readerProduced() {
+        drainToStage()
+        // A writer holding the lock sends [stage] after its current write; otherwise send it now. Past the
+        // bound, wait for the lock so a peer that keeps provoking replies cannot grow [stage].
+        if (!writeLock.isLocked || stage.readableBytes > STAGE_LIMIT) flushLocked()
+    }
+
+    private suspend fun waitForWriteRetry() = retryLock.withLock { }
+
+    /** Out of line: feed once under [feedLock], unless someone fed meanwhile. */
+    private suspend fun feedOnce() {
+        val seen = fedGeneration
+        feedLock.withLock { if (fedGeneration == seen && !feedMore()) engine.transportEof() }
+    }
+
+    /** Give the engine more ciphertext; false at transport EOF. Caller holds [feedLock]. */
     private suspend inline fun feedMore(): Boolean {
         if (inputEof) return false
         if (cin.readableBytes == 0) {
@@ -253,8 +289,9 @@ class TlsStream(private val inner: IoStream, private val engine: TlsEngine, buff
             if (n < 0) { inputEof = true; return false }
         }
         val fed = engine.feedCiphertext(cin.backingArray(), cin.readerIndex(), cin.readableBytes)
-        if (fed == 0) throw IoException("TLS engine accepted no ciphertext while waiting for input")
+        // A full input BIO is fine: the engine has unprocessed input and the next call makes progress.
         cin.consume(fed)
+        fedGeneration++
         return true
     }
 
@@ -262,53 +299,62 @@ class TlsStream(private val inner: IoStream, private val engine: TlsEngine, buff
         val total = src.readableBytes
         while (src.readableBytes > 0) {
             val len = minOf(src.readableBytes, MAX_PLAINTEXT_RECORD)
-            writeLock.withLock {
-                checkOpen()
-                // Room for the whole record, so the write normally completes at once.
-                if (engine.pendingCiphertext > 0) flushOutOfLine()
-                while (true) {
-                    // Retries pass exactly the same bytes (the engine requires it); src moves only after the
-                    // record's ciphertext has been handed to inner.
-                    val r = engine.write(src.backingArray(), src.readerIndex(), len)
-                    if (r > 0) { writeRetryPending = false; break }
-                    when (r) {
-                        TlsEngine.NEED_WRITE -> { writeRetryPending = true; flushOutOfLine() }
-                        TlsEngine.NEED_READ -> throw IoException("TLS write needs peer data (renegotiation is not supported)")
-                        else -> unexpected("write", r)
-                    }
+            checkOpen()
+            while (true) {
+                // Retries pass exactly the same bytes (the engine requires it); src moves only after the
+                // record's ciphertext has been handed to inner.
+                val r = engine.write(src.backingArray(), src.readerIndex(), len)
+                if (r > 0) break
+                when (r) {
+                    TlsEngine.NEED_WRITE -> drainToStage()             // no suspension before the retry
+                    TlsEngine.NEED_READ -> writerNeedsInput()
+                    else -> unexpected("write", r)
                 }
-                flushCiphertext()
-                src.consume(len)
             }
+            if (writeRetryPending) endWriteRetry()
+            drainToStage()
+            flushInline()                                           // hot: inline, no frame of its own
+            src.consume(len)
         }
         return total
     }
 
-    /** Rare paths: take the write lock and flush (out of line, see above). */
-    private suspend fun flushLocked() = writeLock.withLock { flushCiphertext() }
+    /** A write returned WANT_READ: hold the engine (the reader waits), send what is staged, feed, repeat. */
+    private suspend fun writerNeedsInput() {
+        if (!writeRetryPending) { retryLock.lock(); writeRetryPending = true }
+        drainToStage()
+        flushLocked()
+        feedOnce()
+    }
 
-    /** Rare paths with the lock already held. */
-    private suspend fun flushOutOfLine() = flushCiphertext()
+    private fun endWriteRetry() { writeRetryPending = false; retryLock.unlock() }
 
-    private fun unexpected(op: String, result: Int): Nothing = error("unexpected TLS $op result $result")
-
-    /** Write every pending ciphertext byte to [inner]. Caller holds [writeLock]. */
-    private suspend inline fun flushCiphertext() {
+    /** Move everything the engine has produced into [stage] ([overflow] while [stage] is being sent). Never suspends. */
+    private fun drainToStage() {
+        val into = if (flushing) overflow else stage
         while (true) {
-            while (true) {
-                val pending = engine.pendingCiphertext
-                if (pending == 0) break
-                cout.reserve(minOf(pending, cout.backingArray().size.coerceAtLeast(RECORD_SLACK)))
-                val space = cout.backingArray().size - cout.writerIndex()
-                val n = engine.drainCiphertext(cout.backingArray(), cout.writerIndex(), space)
-                if (n <= 0) break
-                cout.commitWrite(n)
-            }
-            if (cout.readableBytes == 0) return
-            inner.write(cout)
-            checkOpen()
+            val pending = engine.pendingCiphertext
+            if (pending == 0) return
+            into.reserve(pending)
+            val n = engine.drainCiphertext(into.backingArray(), into.writerIndex(), into.backingArray().size - into.writerIndex())
+            if (n <= 0) return
+            into.commitWrite(n)
         }
     }
+
+    /** Send [stage] (and whatever is staged meanwhile) to [inner]. Rare paths: out of line. */
+    private suspend fun flushLocked() = flushInline()
+
+    private suspend inline fun flushInline() = writeLock.withLock {
+        while (stage.readableBytes > 0) {
+            flushing = true
+            try { inner.write(stage) } finally { flushing = false }
+            checkOpen()
+            if (overflow.readableBytes > 0) { stage.writeBytes(overflow.backingArray(), overflow.readerIndex(), overflow.readableBytes); overflow.clear() }
+        }
+    }
+
+    private fun unexpected(op: String, result: Int): Nothing = error("unexpected TLS $op result $result")
 
     private companion object {
         const val MAX_PLAINTEXT_RECORD = 16 * 1024
@@ -316,5 +362,7 @@ class TlsStream(private val inner: IoStream, private val engine: TlsEngine, buff
         const val RECORD_SLACK = 1024
         /** Space offered to each engine read: a whole record's plaintext when the caller's buffer allows. */
         const val MIN_READ = 4 * 1024
+        /** Ciphertext the reader may stage while a writer holds the network before it waits (SPEC §2). */
+        const val STAGE_LIMIT = 64 * 1024
     }
 }
