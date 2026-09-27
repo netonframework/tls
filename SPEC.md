@@ -36,8 +36,8 @@
 - 取消：**不声明 `ResumableAfterCancel`**。读写被取消（或超时抛出）后流关闭：取消可能发生在一条记录只写出一半时，TLS 无法
   继续在同一连接上正确收发。被取消的写：`src` 只计入整条记录已交给 `inner` 的明文，对端收到的明文不会多于 `src` 的前移量
   （对端可能因半条记录而报错，而不是正常 EOF）。
-- 握手：首次读或写时自动进行；也可显式 `handshake()`。握手失败抛 `TlsHandshakeException`（`IoException`，带
-  `TlsFailureKind`、验证码、告警码），失败前尽力把引擎生成的告警写给对端，然后关闭。
+- 握手：首次读或写时自动进行；也可显式 `handshake()`。TLS 失败抛 `TlsFailureException`（`IoException`，带
+  `TlsFailureKind`、验证码、告警码，`duringHandshake` 区分握手阶段），失败前尽力把引擎生成的告警写给对端，然后关闭。
 - 连接信息：握手完成后可取 `alpn`、`protocolVersion`、`cipherSuite`、`serverName`（服务端）、`peerCertificates()`（DER，叶子在前）、
   `exportKeyingMaterial`。
 
@@ -45,7 +45,7 @@
 
 - `io-testkit` 一致性套件：`TlsStream`（TCP 之上、内存流之上）全部通过；取消相关检查按 §3 "不声明 ResumableAfterCancel" 的规则。
 - 专项：TLS 1.2 / 1.3 握手与收发；分片（`inner` 每次只给 1 字节）；大块（1 MiB）双向同时收发；ALPN 协商；主机名错误 / 未知 CA /
-  过期证书 → `TlsHandshakeException` 分类正确；mTLS；close_notify → -1；无 close_notify 的 EOF → `TlsTruncatedException`；
+  过期证书 → `TlsFailureException` 分类正确；mTLS；close_notify → -1；无 close_notify 的 EOF → `TlsTruncatedException`；
   `shutdownOutput` 后仍可读；关闭时挂起的读写得到 `ClosedException`；取消读 / 写后流关闭。
 - 测试证书：测试代码内用 openssl-kotlin 的原始绑定生成自签 CA 与叶子证书（仅测试，不进入任何可用配置）。
 
