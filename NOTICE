@@ -1,0 +1,6 @@
+tls
+Copyright 2026 Neton Stream (https://netonstream.com)
+
+Licensed under the Apache License, Version 2.0. See LICENSE.
+
+TLS itself is provided by OpenSSL (https://www.openssl.org), Apache License 2.0, through com.netonstream:openssl.
