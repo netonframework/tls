@@ -1,4 +1,4 @@
-plugins { kotlin("multiplatform") }
+plugins { kotlin("multiplatform"); `maven-publish` }
 
 // The targets com.netonstream:openssl and com.netonstream:io both provide.
 kotlin {
