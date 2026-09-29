@@ -10,12 +10,12 @@ kotlin {
 
     sourceSets {
         commonMain.dependencies {
-            api("com.netonstream:io:0.2.0-SNAPSHOT")
-            api("com.netonstream:openssl:4.0.2")
+            api("com.netonstream:io:0.1.0")
+            api("com.netonstream:openssl:0.1.0")
         }
         commonTest.dependencies {
             implementation(kotlin("test"))
-            implementation("com.netonstream:io-testkit:0.2.0-SNAPSHOT")
+            implementation("com.netonstream:io-testkit:0.1.0")
         }
     }
 }
