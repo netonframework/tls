@@ -11,7 +11,7 @@ kotlin {
     sourceSets {
         commonMain.dependencies {
             api("com.netonstream:io:0.1.0")
-            api("com.netonstream:openssl:0.1.0")
+            api("com.netonstream:openssl:4.0.2")
         }
         commonTest.dependencies {
             implementation(kotlin("test"))
