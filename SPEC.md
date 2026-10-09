@@ -113,3 +113,26 @@
   （见 §3）：去掉修正时"`inner` 报告已关闭"一例未释放、测试失败。
   `EngineOps` 接口与高水位统计的代价：该回显实验中每请求 +116 条指令（约 +0.5%），分配不变；此前"与之前一致"的表述只说明该实验未观察到明显的
   指令数回退，不等于没有性能代价。测试 16/16：macOS；colima Linux arm64 三种驱动配置各 3 次。
+
+## 7. 0.2.0：系统信任库、HTTPS 与 wss 连接器、CI（2026-10-09）
+- **依赖**：io 0.1.0 → 0.3.2（io-testkit 同步），openssl 4.0.2；Kotlin 2.4.20。原有 16 个测试不改即通过。
+- **系统信任库** `systemTrustRootsPem()`（rustls-native-certs `load_native_certs`）：`SSL_CERT_FILE` / `SSL_CERT_DIR` 设置时取代平台存储；
+  否则 Linux 取发行版证书包（openssl-probe 的清单，都没有时 `/etc/ssl/certs`）、Android 取 Conscrypt APEX 或系统 CA 目录、macOS 取
+  Security 框架的锚证书、Windows 取系统 ROOT 存储；iOS 没有可用 API，抛 `UnsupportedOperationException`。每张证书以 `d2i_X509` 校验，
+  重复的只留一份，输出一个 PEM 包供 `TlsContext(trustRootsPem = ...)` 使用（openssl-kotlin 的上下文只收 PEM，且它的"默认路径"是
+  OpenSSL 编译时的目录，不是系统信任库）。来源与 quic 的 `Certificates.system()` 相同（quic 不依赖 tls，两处各有一份；openssl-kotlin
+  不由本仓库修改）。`d2i_X509` 的长度参数在 Windows 上是 32 位，用 `convert()`。
+- `peerIdentityOf(host)`：URL 中的 IP 字面量（含 `[::1]`）按证书 IP 校验，其余按 DNS 名（并作为 SNI）。
+- **`tls-http`**（新坐标 `com.netonstream:tls-http`，hyper-rustls 的角色）：`HttpsConnector` 实现 http 连接池客户端的 `Connector`：
+  `https` 先经 `HttpConnector` 建 TCP，再 `tlsConnect`，ALPN 选中 `h2` 时报告 `negotiatedH2`，客户端在该连接上用 HTTP/2；`http` 照常
+  明文（`httpsOnly` 时拒绝）。默认上下文：系统信任库，ALPN `h2`、`http/1.1`；传入的上下文归调用方。与 hyper-util 相同，ALPN 只有握手后
+  才知道，尚无连接时的一批并发请求可能各开一个连接；之后的并发请求共用已协商出 h2 的连接（测试按此断言）。
+- **`tls-websocket`**（新坐标 `com.netonstream:tls-websocket`）：`WssConnector` 实现 websocket 的 `TlsConnector`（`connect("wss://...")`
+  用它包 TLS），默认上下文为系统信任库、ALPN `http/1.1`。
+- 两个模块独立成坐标：http 与 websocket 本身不带 TLS（hyper、tungstenite 亦然），tls 也不依赖它们。
+- **测试**（macOS）：tls 18（新增系统信任库 2 个：本机 157 个根、PEM 读取跳过文本与私钥块）；tls-http 6（ALPN h2 时并发请求共用
+  一个连接、只给 http/1.1 时保持连接复用、IP 地址按 IP SAN 校验、不受信任的服务端被拒绝（`TlsFailureException`）、`httpsOnly`、默认
+  上下文可建）；tls-websocket 3（wss 回显含 70 KB 消息、不受信任被拒绝、默认上下文）。全部目标与发布用的元数据编译通过。
+- **CI**（本仓库此前没有）：三个模块的测试在 macOS、Linux（epoll、io_uring）、Windows（IOCP、WSAPoll）上运行，另编译全部目标；
+  摘要中打印各平台读到的系统根数量。
+
