@@ -333,7 +333,15 @@ class TlsStream internal constructor(private val inner: IoStream, private val en
             }
             if (writeRetryPending) endWriteRetry()
             drainToStage()
-            flushInline()                                           // hot: inline, no frame of its own
+            try {
+                flushInline()                                       // hot: inline, no frame of its own
+            } catch (e: CancellationException) {
+                // A completion-based inner (IOCP, io_uring) may have sent the whole record before the cancel
+                // took effect: the peer will decrypt it, so src must say it was sent. A record cut in half
+                // never decrypts, and src stays.
+                if (stage.readableBytes == 0 && overflow.readableBytes == 0) src.consume(len)
+                throw e
+            }
             src.consume(len)
         }
         return total
