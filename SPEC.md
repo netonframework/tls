@@ -153,3 +153,14 @@
   去掉修正后前两个失败（期望 32,768 实为 16,384；期望 16,384 实为 0），第三个照常通过（修正不影响它），恢复修正后全部通过。
   每个测试同时断言对端收到的是负载的前缀。macOS tls 测试 21 个全部通过。
 
+## 9. 握手时限（2026-10-11）
+- **缺口**：握手没有时限。连接后不发数据（或发得极慢）的对端一直占着流、引擎与原生内存；tokio-rustls 同样没有，
+  由调用方（如 axum-server、hyper-util）各自加。本库把它作为资源上限（stack 工程标准 §7.2）放在入口。
+- **接口**：`tlsConnect(..., handshakeTimeoutMillis = DEFAULT_HANDSHAKE_TIMEOUT_MILLIS)`、`tlsAccept(..., handshakeTimeoutMillis = ...)`，
+  默认 10 s，0 不设限。超时：关闭流（与其他握手失败相同，调用方拿不到 `TlsStream`），抛 `TlsHandshakeTimeoutException(timeoutMillis)`
+  （`IoException`）。新参数在末尾、带默认值，原有调用源码不变；默认值是行为变化（此前无限等待），发版按次版本处理。
+  `tls-http` 的 `HttpsConnector`、`tls-websocket` 的 `WssConnector` 走 `tlsConnect` 的默认值。
+- **测试**（`HandshakeTimeoutTest`）：不发数据的客户端 → 服务端 200 ms 后放弃，对端读到 EOF；只收不回的服务端 → 客户端 200 ms 后放弃，
+  对端读到 EOF；0 与 5 s 的时限内握手照常完成；默认值为 10 s。去掉时限逻辑后前者挂到外层 10 s 超时、测试失败。macOS：tls 24、tls-http 6、
+  tls-websocket 3 全部通过。
+

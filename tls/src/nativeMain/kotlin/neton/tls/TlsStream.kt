@@ -1,6 +1,8 @@
 package neton.tls
 
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import neton.io.bytes.Buffer
@@ -31,29 +33,55 @@ open class TlsFailureException(
 /** The peer ended the transport without close_notify: the data may have been cut short (SPEC §3). */
 class TlsTruncatedException : IoException("TLS stream ended without close_notify (possible truncation)")
 
-/** Open a client TLS session over [stream] to [peer] and complete the handshake. On failure [stream] is closed. */
-suspend fun tlsConnect(stream: IoStream, context: TlsContext, peer: PeerIdentity, bufferCapacity: Int = DEFAULT_BUFFER): TlsStream =
-    start(stream, bufferCapacity) { context.newEngine(peer, bufferCapacity) }
+/** The handshake did not complete within [timeoutMillis] (SPEC §9); the stream was closed. */
+class TlsHandshakeTimeoutException(val timeoutMillis: Long) : IoException("TLS handshake not completed within $timeoutMillis ms")
 
-/** Accept a server TLS session over [stream] and complete the handshake. On failure [stream] is closed. */
-suspend fun tlsAccept(stream: IoStream, context: TlsContext, bufferCapacity: Int = DEFAULT_BUFFER): TlsStream =
-    start(stream, bufferCapacity) { context.newEngine(bufferCapacity = bufferCapacity) }
+/**
+ * Open a client TLS session over [stream] to [peer] and complete the handshake, within [handshakeTimeoutMillis]
+ * (0: no limit; else [TlsHandshakeTimeoutException]). On failure [stream] is closed.
+ */
+suspend fun tlsConnect(
+    stream: IoStream, context: TlsContext, peer: PeerIdentity, bufferCapacity: Int = DEFAULT_BUFFER,
+    handshakeTimeoutMillis: Long = DEFAULT_HANDSHAKE_TIMEOUT_MILLIS,
+): TlsStream = start(stream, bufferCapacity, handshakeTimeoutMillis) { context.newEngine(peer, bufferCapacity) }
+
+/**
+ * Accept a server TLS session over [stream] and complete the handshake, within [handshakeTimeoutMillis] (0: no limit;
+ * else [TlsHandshakeTimeoutException]): a peer that connects and then sends nothing, or too slowly, does not hold the
+ * stream and the engine. On failure [stream] is closed.
+ */
+suspend fun tlsAccept(
+    stream: IoStream, context: TlsContext, bufferCapacity: Int = DEFAULT_BUFFER,
+    handshakeTimeoutMillis: Long = DEFAULT_HANDSHAKE_TIMEOUT_MILLIS,
+): TlsStream = start(stream, bufferCapacity, handshakeTimeoutMillis) { context.newEngine(bufferCapacity = bufferCapacity) }
 
 private inline fun newTls(stream: IoStream, bufferCapacity: Int, engine: () -> TlsEngine): TlsStream {
     val e = try { engine() } catch (t: Throwable) { stream.close(); throw t }
     return TlsStream(stream, e, bufferCapacity)
 }
 
-private suspend inline fun start(stream: IoStream, bufferCapacity: Int, engine: () -> TlsEngine): TlsStream {
+private suspend inline fun start(stream: IoStream, bufferCapacity: Int, timeoutMillis: Long, engine: () -> TlsEngine): TlsStream {
+    require(timeoutMillis >= 0) { "negative handshake timeout: $timeoutMillis" }
     val tls = newTls(stream, bufferCapacity, engine)
-    // Any handshake failure (TLS error, peer close, inner closed, cancellation) releases the engine and
+    // Any handshake failure (TLS error, peer close, inner closed, cancellation, timeout) releases the engine and
     // the stream: the caller never receives the TlsStream, so nobody else could (close is idempotent).
-    try { tls.handshake() } catch (t: Throwable) { tls.close(); throw t }
+    try {
+        if (timeoutMillis == 0L) tls.handshake() else withTimeout(timeoutMillis) { tls.handshake() }
+    } catch (e: TimeoutCancellationException) {
+        tls.close()
+        throw TlsHandshakeTimeoutException(timeoutMillis)
+    } catch (t: Throwable) {
+        tls.close()
+        throw t
+    }
     return tls
 }
 
 /** Engine ciphertext buffer size (the BIO pair's capacity per direction). */
 const val DEFAULT_BUFFER = 16 * 1024
+
+/** Default handshake limit of [tlsConnect] and [tlsAccept] (SPEC §9); 0 disables it. */
+const val DEFAULT_HANDSHAKE_TIMEOUT_MILLIS: Long = 10_000
 
 /**
  * TLS over [inner] as an [IoStream] (SPEC §2–§3). The [engine] (openssl-kotlin) does all TLS work;
