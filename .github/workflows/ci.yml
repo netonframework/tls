@@ -40,7 +40,7 @@ jobs:
         run: |
           target="${{ matrix.target }}"
           t="$(echo "${target:0:1}" | tr '[:upper:]' '[:lower:]')${target:1}"
-          ./gradlew :tls:${t}Test :tls-http:${t}Test :tls-websocket:${t}Test --no-daemon --stacktrace --continue
+          ./gradlew :tls:${t}Test :tls-http:${t}Test :tls-websocket:${t}Test -PskipComposition --no-daemon --stacktrace --continue
       - name: Summary
         if: always()
         shell: bash
@@ -64,6 +64,71 @@ jobs:
           path: |
             */build/test-results/**
             */build/reports/tests/**
+          if-no-files-found: ignore
+
+  composition:
+    # HTTP and WebSocket over TLS over TCP on each reactor, every layer real (SPEC §10), against the main branches of http
+    # and websocket (built from source with --include-build), so fixes there are checked before they are released.
+    name: composition (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: macOS kqueue, os: macos-14, target: MacosArm64, driver: "" }
+          - { name: Linux epoll, os: ubuntu-latest, target: LinuxX64, driver: epoll }
+          - { name: Linux io_uring, os: ubuntu-latest, target: LinuxX64, driver: iouring }
+          - { name: Windows IOCP, os: windows-latest, target: MingwX64, driver: "" }
+          - { name: Windows WSAPoll, os: windows-latest, target: MingwX64, driver: wsapoll }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    env:
+      NETON_IO_DRIVER: ${{ matrix.driver }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with: { repository: netonframework/http, path: deps/http }
+      - uses: actions/checkout@v4
+        with: { repository: netonframework/websocket, path: deps/websocket }
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Cache Kotlin/Native toolchain
+        uses: actions/cache@v4
+        with:
+          path: ~/.konan
+          key: konan-${{ runner.os }}-${{ hashFiles('**/*.gradle.kts', 'gradle/libs.versions.toml') }}
+      - name: Test
+        shell: bash
+        run: |
+          target="${{ matrix.target }}"
+          t="$(echo "${target:0:1}" | tr '[:upper:]' '[:lower:]')${target:1}"
+          echo "http $(git -C deps/http rev-parse --short HEAD), websocket $(git -C deps/websocket rev-parse --short HEAD)"
+          ./gradlew --include-build deps/http --include-build deps/websocket \
+            :tls-http:${t}Test --tests '*CompositionTest*' :tls-websocket:${t}Test --tests '*CompositionTest*' --no-daemon --stacktrace --continue
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          python3 - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          import glob, re
+          tests = fails = 0; failed = []
+          for f in glob.glob('tls-*/build/test-results/**/*.xml', recursive=True):
+              s = open(f, encoding='utf-8', errors='replace').read()
+              m = re.search(r'tests="(\d+)"', s); tests += int(m.group(1)) if m else 0
+              for c in re.finditer(r'<testcase name="([^"]+)" classname="([^"]+)"[^>]*>\s*<failure message="([^"]*)"', s):
+                  fails += 1; failed.append(f"- {c.group(2)}.{c.group(1)}: {c.group(3)[:300]}")
+          print(f"### composition, ${{ matrix.name }}: {tests} tests, {fails} failures")
+          print("\n".join(failed))
+          PY
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: composition-results-${{ matrix.name }}
+          path: |
+            tls-*/build/test-results/**
+            tls-*/build/reports/tests/**
           if-no-files-found: ignore
 
   build-all-targets:

@@ -164,3 +164,27 @@
   对端读到 EOF；0 与 5 s 的时限内握手照常完成；默认值为 10 s。去掉时限逻辑后前者挂到外层 10 s 超时、测试失败。macOS：tls 24、tls-http 6、
   tls-websocket 3 全部通过。
 
+## 10. 跨层组合测试（2026-10-11）
+
+各层自己的测试多用内存流或测试替身；这一组让 HTTP / WebSocket 经本库 TLS、真实 TCP 与各平台反应器（kqueue、epoll、io_uring、IOCP、
+WSAPoll）一起运行，检验层与层之间的传递：大于 TLS 记录、流控窗口与套接字缓冲的数据、背压、取消与关闭。
+
+- **HTTPS**（`tls-http` `CompositionTest`，HTTP/2 与 HTTP/1.1 各一份，由 ALPN 选定）：8 MiB 下载与上传逐字节校验、全程一个连接；客户端停读
+  时服务端对无限响应体的取用停在 32 MiB 以下（实测 HTTP/2 约 2.1 MiB、HTTP/1.1 约 0.9 MiB），恢复读取后继续；客户端丢弃响应体后服务端
+  停止取用——HTTP/2 复位该流、连接继续承载后续请求，HTTP/1.1 关闭该连接；服务端响应体中途失败时客户端得到错误而不是被截断的"正常结束"，
+  之后照常请求。
+- **wss**（`tls-websocket` `CompositionTest`）：8 MiB 二进制消息往返逐字节校验；服务端停读时客户端发送被挡在 32 MiB 以下、恢复后 64 MiB
+  全部到达；服务端以 1001 关闭、客户端收到该码后正常结束；客户端发起关闭后服务端以 close_notify 结束 TLS（原始 TLS 客户端读到 EOF 而非
+  截断）；不带关闭帧直接断开时客户端得到错误而不是正常结束。
+- **由此发现并已修复的缺陷**：
+  1. http：HTTP/1 客户端丢弃未读完的响应体时，连接既不复用也不关闭，服务端一直卡在写上（http SPEC 同日条目，a3fb7bc）。
+  2. websocket：关闭握手完成后服务端不发 close_notify 直接关闭，客户端又把对端关闭帧之后的 TLS 截断当作 I/O 错误，正常关闭以
+     `WebSocketException.Io` 结束（websocket SPEC §11.9，65dda80）。
+- **运行方式**：这两处修复在 http / websocket 0.2.0 之后，组合测试因此对它们的 main 运行：CI 新增 `composition` 作业，五种反应器上签出
+  netonframework/http 与 websocket 的 main，以 `--include-build` 构建，只跑 `*CompositionTest*`；常规 `test` 作业仍用已发布版本，以
+  `-PskipComposition` 排除这组测试。本地：`./gradlew --include-build ../http --include-build ../websocket :tls-http:macosArm64Test --tests
+  '*CompositionTest*' :tls-websocket:macosArm64Test --tests '*CompositionTest*'`（macOS arm64：8 + 5 个通过）。在两个依赖所用的方式之间切换后，
+  若链接报 "is cached … but its dependency isn't"，删除 `tls-*/build/kotlin-native-ic-cache`。tls-http / tls-websocket 依赖含修复的版本后，
+  去掉开关并入常规作业。
+- HTTP/3 → QUIC → UDP → 反应器的组合由 http3 仓库承担（其测试在 neton.quic 上经回环 UDP 运行，含真实 TLS 1.3 变体）。
+
