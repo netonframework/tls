@@ -106,8 +106,9 @@
   来自 OpenSSL `CRYPTO_zalloc`）、`free` 103 次（752 指令，`CRYPTO_free`）；`memset` 13 次共 3.1k 指令，其中 OpenSSL `tls_write_records_default`
   每条记录一次约 2.4k，其余为结构体清零与本库 / 反应器的栈帧清零（各数百指令）。原生分配与清零的用途（结构体初始化、记录缓冲、秘密数据清除）
   尚未逐项定位，不能为跑分删除秘密数据的清零。
-- 未覆盖：TLS 1.3 KeyUpdate（openssl-kotlin 未提供触发接口，无法在测试中产生）；写入遇到 WANT_READ 的路径（TLS 1.3 下正常情况不会出现，代码按
-  契约处理但尚无测试能触发）。
+- 未覆盖（当时）：TLS 1.3 KeyUpdate（openssl-kotlin 未提供触发接口，无法在测试中产生）；写入遇到 WANT_READ 的路径（TLS 1.3 下正常情况不会出现，代码按
+  契约处理但尚无测试能触发）。两项随后由 2cc2bec 补上：`KeyUpdateTest` 以原始 OpenSSL 调用构造的测试服务端请求密钥更新，脚本引擎测试覆盖
+  WANT_READ 写入（见下）。
 - **第二轮审查的修正（2026-09-28）**：(1) 待发密文预算按暂存 + 溢出总量计（见 §2），脚本引擎测试：小消息写入阻塞、对端每 10 字节诱发 100 字节
   应答时高水位 10.3 KB（上限 22.5 KB），改回旧检查则达 200 KB、测试失败；恢复读取后对端收到的字节与引擎产出顺序完全一致。(2) 握手失败统一释放
   （见 §3）：去掉修正时"`inner` 报告已关闭"一例未释放、测试失败。
@@ -135,4 +136,20 @@
   上下文可建）；tls-websocket 3（wss 回显含 70 KB 消息、不受信任被拒绝、默认上下文）。全部目标与发布用的元数据编译通过。
 - **CI**（本仓库此前没有）：三个模块的测试在 macOS、Linux（epoll、io_uring）、Windows（IOCP、WSAPoll）上运行，另编译全部目标；
   摘要中打印各平台读到的系统根数量。
+
+## 8. 取消写入的计数：IOCP 上发现的缺陷（2026-10-09 / 10）
+- **现象**：0.2.0 首次在 Windows IOCP 上跑 CI（提交 6b24f09，运行 37925871731），`TlsStreamTest.conformanceOverTcp` 的一致性检查
+  "被取消的写入恰好推进已发送的字节"失败：对端收到 196,608 字节，`src` 只记 180,224，多出一条完整记录。其余平台通过。
+- **原因**：完成式驱动（IOCP，io_uring 同类）上，内核可能在取消送达的同时完成发送：内层流把字节记为已发送，同时以取消结束这次写入。
+  `writeAll` 只在 `flushInline()` 正常返回后才 `src.consume(len)`，于是一条已整条发出、对端能解密的记录没有计入 `src`。
+- **修正**（dc1e86a，即 0.2.0 的发版提交）：`flushInline()` 抛出 `CancellationException` 时，若本条记录的密文已全部离开（`stage` 与
+  `overflow` 都空），先 `src.consume(len)` 再抛出；只发出一部分的记录永远无法解密，`src` 不动。修正后 CI 五个平台通过（运行 37926783790、
+  37927504344）。
+- **确定性回归测试**（2026-10-10，`CancelledWriteTest`）：真实竞态取决于时序，一致性套件中的检查只能偶然触发；这里用包在内层流外的测试替身
+  `CancelAfterSending`，在第 N 次写入时先交出给定比例的字节、再抛 `CancellationException`，按需复现两种结局：
+  - `aRecordSentWholeBeforeTheCancellationCountsAsWritten`：第 2 条记录整条发出后取消 → `src` 前进 2 × 16 KiB，与对端收到的字节相等；
+  - `theFirstRecordSentWholeCountsToo`：第 1 条记录整条发出后取消 → 16 KiB；
+  - `aRecordCutInHalfDoesNotCount`：第 2 条记录只发出一半 → `src` 只前进 16 KiB（第 1 条），对端也只能解密 16 KiB。
+  去掉修正后前两个失败（期望 32,768 实为 16,384；期望 16,384 实为 0），第三个照常通过（修正不影响它），恢复修正后全部通过。
+  每个测试同时断言对端收到的是负载的前缀。macOS tls 测试 21 个全部通过。
 
