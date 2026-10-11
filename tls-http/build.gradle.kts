@@ -26,7 +26,7 @@ kotlin {
     sourceSets {
         commonMain.dependencies {
             api(project(":tls"))
-            api("com.netonstream:http:0.2.0")
+            api("com.netonstream:http:0.3.0")
         }
         commonTest.dependencies { implementation(kotlin("test")) }
     }
