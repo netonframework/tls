@@ -3,6 +3,15 @@ plugins { kotlin("multiplatform"); `maven-publish` }
 // com.netonstream:tls-http: HTTPS for com.netonstream:http's pooling client (the role of hyper-rustls for hyper-util).
 // Kept out of http, which has no TLS of its own, and out of tls, which does not depend on http.
 kotlin {
+    // The JVM (desktop and Android apps): TLS through openssl-kotlin's JNI library; bytecode 1.8, API 2.2 and stdlib
+    // 2.2.21 so Android hosts on Kotlin 2.1 can use it (as neton-io and openssl).
+    coreLibrariesVersion = "2.2.21"
+    jvm {
+        compilerOptions {
+            jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_1_8)
+            apiVersion.set(org.jetbrains.kotlin.gradle.dsl.KotlinVersion.KOTLIN_2_2)
+        }
+    }
     linuxX64(); linuxArm64()
     macosArm64(); macosX64()
     mingwX64()
