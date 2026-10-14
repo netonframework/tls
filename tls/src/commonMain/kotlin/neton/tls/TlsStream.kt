@@ -1,8 +1,7 @@
 package neton.tls
 
 import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.TimeoutCancellationException
-import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import neton.io.bytes.Buffer
@@ -66,10 +65,10 @@ private suspend inline fun start(stream: IoStream, bufferCapacity: Int, timeoutM
     // Any handshake failure (TLS error, peer close, inner closed, cancellation, timeout) releases the engine and
     // the stream: the caller never receives the TlsStream, so nobody else could (close is idempotent).
     try {
-        if (timeoutMillis == 0L) tls.handshake() else withTimeout(timeoutMillis) { tls.handshake() }
-    } catch (e: TimeoutCancellationException) {
-        tls.close()
-        throw TlsHandshakeTimeoutException(timeoutMillis)
+        if (timeoutMillis == 0L) tls.handshake()
+        else if (withTimeoutOrNull(timeoutMillis) { tls.handshake(); true } == null) {
+            throw TlsHandshakeTimeoutException(timeoutMillis)
+        }
     } catch (t: Throwable) {
         tls.close()
         throw t
@@ -241,12 +240,17 @@ class TlsStream internal constructor(private val inner: IoStream, private val en
     }
 
     private suspend fun sendAlertAndClose() {
-        if (!closed) try {
-            drainToStage()                      // allowed after a failure: the alert the engine produced
-            if (!writeLock.isLocked) flushLocked()
+        try {
+            if (!closed) {
+                drainToStage()                  // allowed after a failure: the alert the engine produced
+                if (!writeLock.isLocked) withTimeoutOrNull(ALERT_TIMEOUT_MILLIS) { flushLocked() }
+            }
+        } catch (e: CancellationException) {
+            throw e
         } catch (_: Throwable) {
+        } finally {
+            close()
         }
-        close()
     }
 
     private suspend fun ensureHandshake() {
@@ -415,6 +419,7 @@ class TlsStream internal constructor(private val inner: IoStream, private val en
     private fun unexpected(op: String, result: Int): Nothing = error("unexpected TLS $op result $result")
 
     private companion object {
+        const val ALERT_TIMEOUT_MILLIS = 1_000L
         const val MAX_PLAINTEXT_RECORD = 16 * 1024
         /** Headroom above the engine buffer for one record's header, tag and padding. */
         const val RECORD_SLACK = 1024

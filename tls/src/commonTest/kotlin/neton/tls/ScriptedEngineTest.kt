@@ -1,6 +1,8 @@
 package neton.tls
 
 import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeout
@@ -13,6 +15,8 @@ import neton.io.net.runReactor
 import neton.openssl.PeerIdentity
 import neton.openssl.TlsContext
 import neton.openssl.TlsEngine
+import neton.openssl.TlsException
+import neton.openssl.TlsFailureKind
 import neton.openssl.TlsProgress
 import neton.openssl.TlsVersion
 import kotlin.test.Test
@@ -20,6 +24,7 @@ import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
+import kotlin.test.assertNull
 
 /**
  * A scripted engine: "ciphertext" is the plaintext itself, through bounded input / output queues like a BIO
@@ -42,9 +47,14 @@ private class ScriptedEngine(private val bio: Int) : EngineOps {
     private var copied = 0               // bytes of that write already in [output]
     private var fedSinceWrite = 0
     var closed = false
+    var failRead = false
 
     override fun handshake() = TlsProgress.COMPLETE
     override fun read(output: ByteArray, offset: Int, length: Int): Int {
+        if (failRead) {
+            emit(1)
+            throw TlsException(TlsFailureKind.PROTOCOL, 0, null, "scripted fatal alert")
+        }
         if (pendingWrite >= 0) { readsWhileWritePending++; error("read while a write waits for its retry") }
         if (input.isEmpty()) return TlsEngine.NEED_READ
         val n = minOf(length, input.size)
@@ -89,6 +99,33 @@ private class ScriptedEngine(private val bio: Int) : EngineOps {
 }
 
 class ScriptedEngineTest {
+
+    @Test
+    fun fatalAlertCannotBlockClosingAndPreservesOuterCancellation() = runReactor {
+        withTimeout(10_000) {
+            for (cancel in listOf(false, true)) {
+                val (a, peer) = memoryStreamPair()
+                var closed = false
+                var writes = 0
+                val blocked = object : IoStream by a {
+                    override suspend fun write(src: Buffer): Int { writes++; awaitCancellation() }
+                    override fun close() { closed = true; a.close() }
+                }
+                val engine = ScriptedEngine(1024).also { it.failRead = true }
+                val tls = TlsStream(blocked, engine, 1024)
+                try {
+                    if (cancel) {
+                        assertNull(withTimeoutOrNull(100) { tls.read(Buffer()) })
+                    } else {
+                        withTimeout(3_000) { assertFailsWith<TlsFailureException> { tls.read(Buffer()) } }
+                    }
+                    assertEquals(1, writes)
+                    assertTrue(closed)
+                    assertTrue(engine.closed)
+                } finally { tls.close(); peer.close() }
+            }
+        }
+    }
 
     private fun buf(bytes: ByteArray) = Buffer().also { it.writeBytes(bytes) }
 

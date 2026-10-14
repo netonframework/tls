@@ -54,6 +54,8 @@
   报告已关闭、取消），都关闭已取得的引擎与 `inner`（调用方拿不到 `TlsStream`，只能由工厂释放）；`inner` 抛出 `ClosedException` 时流也随之
   关闭（幂等）。TLS 失败抛 `TlsFailureException`（`IoException`，带
   `TlsFailureKind`、验证码、告警码，`duringHandshake` 区分握手阶段），失败前尽力把引擎生成的告警写给对端，然后关闭。
+  告警发送最多等待 1 s（已有写操作时跳过），无论发送成功、失败或取消都释放流与引擎；外层取消原样传播。
+  只有握手自身期限到期才转换为 `TlsHandshakeTimeoutException`，调用方的超时与显式取消不转换，包括握手期限设为 0 时。
 - 连接信息：握手完成后可取 `alpn`、`protocolVersion`、`cipherSuite`、`serverName`（服务端）、`peerCertificates()`（DER，叶子在前）、
   `exportKeyingMaterial`。
 

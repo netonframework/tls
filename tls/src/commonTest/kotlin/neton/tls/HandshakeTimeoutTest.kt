@@ -1,9 +1,12 @@
 package neton.tls
 
 import kotlinx.coroutines.async
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import neton.io.bytes.Buffer
 import neton.io.core.IoException
 import neton.io.core.memoryStreamPair
@@ -14,6 +17,7 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
+import kotlin.test.assertNull
 import kotlin.time.Duration.Companion.seconds
 import kotlin.time.TimeSource
 
@@ -23,6 +27,42 @@ import kotlin.time.TimeSource
  */
 class HandshakeTimeoutTest {
     private val identity = testIdentity()
+
+    @Test
+    fun outerTimeoutIsNotReportedAsAHandshakeTimeout() = runReactor {
+        withTimeout(10.seconds) {
+            val context = TlsContext(server = true, certificateChainPem = identity.certificate, privateKeyPem = identity.key)
+            try {
+                for (limit in listOf(0L, 5_000L)) {
+                    val (peer, stream) = memoryStreamPair()
+                    try {
+                        assertNull(withTimeoutOrNull(100) {
+                            tlsAccept(stream, context, handshakeTimeoutMillis = limit)
+                        })
+                        assertEquals(-1, drain(peer))
+                    } finally { stream.close(); peer.close() }
+                }
+            } finally { context.close() }
+        }
+    }
+
+    @Test
+    fun explicitCancellationClosesTheHandshakeStream() = runReactor {
+        withTimeout(10.seconds) {
+            val context = TlsContext(server = true, certificateChainPem = identity.certificate, privateKeyPem = identity.key)
+            val (peer, stream) = memoryStreamPair()
+            val reading = CompletableDeferred<Unit>()
+            val tracked = object : neton.io.core.IoStream by stream {
+                override suspend fun read(dst: Buffer): Int { reading.complete(Unit); return stream.read(dst) }
+            }
+            try {
+                val job = launch { tlsAccept(tracked, context, handshakeTimeoutMillis = 0) }
+                reading.await()
+                job.cancelAndJoin()
+                assertEquals(-1, drain(peer))
+            } finally { stream.close(); peer.close(); context.close() }
+        }
+    }
 
     /** Reads everything [peer] sends until it ends; returns how it ended (-1 at EOF). */
     private suspend fun drain(peer: neton.io.core.IoStream): Int {
